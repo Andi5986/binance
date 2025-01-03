@@ -1,3 +1,5 @@
+# trade_market_executor.py
+
 import logging
 from pathlib import Path
 from decimal import Decimal, ROUND_DOWN
@@ -123,12 +125,56 @@ class TradeExecutor:
         """Initialize TradeExecutor with Binance client"""
         self.client = client
         self.logger = logging.getLogger(__name__)
+        self.open_positions = {} 
+    
+    def _wait_for_balance_update(self, symbol: str, expected_qty: float, max_attempts: int = 5) -> bool:
+        """Wait for balance to update after market buy with retries"""
+        asset = symbol.replace('USDT', '')
+        self.logger.info(f"Waiting for {asset} balance to update...")
+        
+        for attempt in range(max_attempts):
+            time.sleep(2)  # Wait 2 seconds between checks
+            
+            try:
+                account = self.client.get_account()
+                asset_balance = float(next(
+                    bal['free'] for bal in account['balances'] 
+                    if bal['asset'] == asset
+                ))
+                
+                self.logger.info(f"Attempt {attempt + 1}/{max_attempts}: {asset} balance = {asset_balance}")
+                
+                if asset_balance >= expected_qty * 0.99999:  # Allow for minimal rounding differences
+                    self.logger.info(f"✅ {asset} balance updated successfully")
+                    return True
+                    
+            except Exception as e:
+                self.logger.error(f"Error checking balance: {str(e)}")
+                
+        self.logger.error(f"❌ Timed out waiting for {asset} balance update")
+        return False
                     
     def execute_trade(self, symbol: str, signal: TradeSignal, usdt_amount: float) -> bool:
         """Execute trade with better order flow handling"""
         filled_qty = None
         
         try:
+            # Check if we already have an open position
+            if symbol in self.open_positions:
+                self.logger.warning(f"Already have an open position for {symbol}")
+                return False
+
+            # Verify available balance with buffer
+            account = self.client.get_account()
+            usdt_balance = float(next(
+                asset['free'] for asset in account['balances'] 
+                if asset['asset'] == 'USDT'
+            ))
+            
+            if usdt_balance < usdt_amount * 1.01:  # 1% buffer
+                self.logger.error(f"Insufficient USDT balance. Required: {usdt_amount:.2f}, Available: {usdt_balance:.2f}")
+                return False
+
             # Get symbol info and market price
             symbol_info = self.get_symbol_info(symbol)
             if not symbol_info:
@@ -177,16 +223,38 @@ class TradeExecutor:
                 filled_qty = float(market_order['executedQty'])
                 filled_price = float(market_order['fills'][0]['price'])
                 self.logger.info(f"Market buy filled: {filled_qty} @ {filled_price}")
+
+                # Track the position
+                self.open_positions[symbol] = {
+                    'quantity': filled_qty,
+                    'entry_price': filled_price,
+                    'time': time.time()
+                }
                 
-                # Wait for order to be processed
-                time.sleep(0.5)
+                # Wait for balance to update with retries
+                if not self._wait_for_balance_update(symbol, filled_qty):
+                    self.logger.error(f"Failed to confirm {symbol} balance update")
+                    return self._close_position(symbol, filled_qty)
 
             except BinanceAPIException as e:
                 self.logger.error(f"Market buy failed: {str(e)}")
                 return False
 
-            # 2. Place OCO sell order
+            # Place OCO sell order
             if filled_qty:
+                # Double check the balance one more time before OCO
+                account = self.client.get_account()
+                asset = symbol.replace('USDT', '')
+                asset_balance = float(next(
+                    bal['free'] for bal in account['balances'] 
+                    if bal['asset'] == asset
+                ))
+                
+                if asset_balance < filled_qty * 0.99999:  # Allow for minimal rounding differences
+                    self.logger.error(f"Insufficient {asset} balance ({asset_balance}) for OCO order. Required: {filled_qty}")
+                    return self._close_position(symbol, asset_balance)
+
+                self.logger.info(f"Placing OCO order with confirmed {asset} balance: {asset_balance}")
                 oco_result = self.place_oco_order(
                     symbol=symbol,
                     side='SELL',
@@ -201,6 +269,8 @@ class TradeExecutor:
                     return True
                 else:
                     self.logger.error(f"❌ OCO order failed for {symbol}")
+                    # Remove from open positions
+                    self.open_positions.pop(symbol, None)
                     # Try to close position
                     return self._close_position(symbol, filled_qty)
 
@@ -210,6 +280,7 @@ class TradeExecutor:
             self.logger.error(f"Error executing trade: {str(e)}")
             # Try to close position if we have a filled quantity
             if filled_qty:
+                self.open_positions.pop(symbol, None)
                 return self._close_position(symbol, filled_qty)
             return False
 
@@ -245,34 +316,31 @@ class TradeExecutor:
 
     def place_oco_order(self, symbol: str, side: str, quantity: float, 
                    stop_price: str, limit_price: str, take_profit_price: str) -> Optional[dict]:
-        """Place an OCO order with correct signature generation"""
+        """Place an OCO (One-Cancels-Other) order with proper formatting"""
         try:
-            # Create base parameters
-            timestamp = str(int(time.time() * 1000))
-            
             # Format quantity to match symbol's precision
             symbol_info = self.get_symbol_info(symbol)
             lot_size = next(filter(lambda x: x['filterType'] == 'LOT_SIZE', 
                             symbol_info['filters']))
             step_size = float(lot_size['stepSize'])
             precision = len(str(step_size).rstrip('0').split('.')[-1])
-            formatted_qty = f"{quantity:.{precision}f}"
+            formatted_qty = f"{quantity:.{precision}f}".rstrip('0').rstrip('.')
 
-            # Build parameters dict with exact order as per Binance API
+            # Parameters for the OCO order - using the standard OCO parameters
             params = {
                 'symbol': symbol,
                 'side': side,
                 'quantity': formatted_qty,
-                'price': take_profit_price,         # Limit order price
+                'price': take_profit_price,         # Limit order price (take profit)
                 'stopPrice': stop_price,            # Stop trigger price
                 'stopLimitPrice': limit_price,      # Stop limit price
                 'stopLimitTimeInForce': 'GTC',
-                'timestamp': timestamp,
+                'timestamp': str(int(time.time() * 1000)),
                 'recvWindow': '5000'
             }
 
-            # Generate query string without urlencoding
-            query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params.keys())])
+            # Generate query string WITHOUT sorting (Binance OCO is order-sensitive)
+            query_string = '&'.join([f"{key}={params[key]}" for key in params.keys()])
             
             # Generate signature
             signature = hmac.new(
@@ -294,7 +362,7 @@ class TradeExecutor:
             self.logger.info(f"  Stop Price: {stop_price}")
             self.logger.info(f"  Limit Price: {limit_price}")
 
-            response = requests.post(url, headers=headers, data=params)  # Use data instead of params
+            response = requests.post(url, headers=headers, params=params)
             
             # Handle response
             if response.status_code == 200:
@@ -313,11 +381,23 @@ class TradeExecutor:
             return None
 
     def _close_position(self, symbol: str, quantity: float) -> bool:
-        """Close position with market order and proper error handling"""
+        """Close position with market order and update tracking"""
         try:
             self.logger.warning(f"Attempting to close position with market order for {symbol}")
             
-            # Format quantity to string with proper precision
+            # Verify we have the asset balance
+            account = self.client.get_account()
+            asset = symbol.replace('USDT', '')
+            asset_balance = float(next(
+                bal['free'] for bal in account['balances'] 
+                if bal['asset'] == asset
+            ))
+            
+            if asset_balance < quantity:
+                self.logger.error(f"Insufficient {asset} balance for closing trade")
+                return False
+
+            # Format quantity with proper precision
             symbol_info = self.get_symbol_info(symbol)
             lot_size = next(filter(lambda x: x['filterType'] == 'LOT_SIZE', 
                             symbol_info['filters']))
@@ -331,12 +411,14 @@ class TradeExecutor:
                 side='SELL',
                 type='MARKET',
                 quantity=formatted_qty,
-                newOrderRespType='FULL'  # Get full response
+                newOrderRespType='FULL'
             )
             
             if close_order['status'] == 'FILLED':
                 filled_price = float(close_order['fills'][0]['price'])
                 self.logger.info(f"Position closed at {filled_price} for {symbol}")
+                # Remove from open positions
+                self.open_positions.pop(symbol, None)
                 return True
             else:
                 self.logger.error(f"Failed to close position: {close_order}")
@@ -501,6 +583,7 @@ class TradeExecutor:
                 if 'stopPrice' in report:
                     self.logger.info(f"    Stop Price: {report.get('stopPrice')}")
                 self.logger.info(f"    Status: {report.get('status')}")
+                
         except Exception as e:
             self.logger.error(f"Error logging order response: {e}")
 

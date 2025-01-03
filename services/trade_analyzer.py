@@ -130,6 +130,7 @@ class TradeAnalyzer:
         self.traders: Dict[str, DataProcessor] = {}
         self.models: Dict[str, PricePredictor] = {}
         self.market_analyzer = MarketAnalyzer(config)
+        self._last_trading_signals = {}
         
     def initialize_traders(self) -> bool:
         """Initialize traders with security checks"""
@@ -212,6 +213,7 @@ class TradeAnalyzer:
     def generate_trading_signals(self) -> Dict[str, TradeSignal]:
         """Generate trading signals with enhanced logging"""
         self.logger.info("Starting signal generation...")
+        self._last_trading_signals = {}
         current_data = self.get_current_market_data()
         signals = {}
         total_analyzed = 0
@@ -240,6 +242,7 @@ class TradeAnalyzer:
         self.logger.info(f"Initial signals found: {signals_found}")
         self.logger.info(f"Valid signals after filtering: {len(signals)}")
         
+        self._last_trading_signals = signals
         return signals
 
     def _generate_single_signal(
@@ -738,3 +741,7 @@ class TradeAnalyzer:
         adx = dx.rolling(window=period).mean()
         
         return adx
+    
+    def get_last_trading_signals(self) -> Dict[str, TradeSignal]:
+        """Retrieve the last generated trading signals"""
+        return self._last_trading_signals
